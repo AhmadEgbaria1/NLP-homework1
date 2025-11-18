@@ -485,6 +485,7 @@ def main():
 
     print(f"[OK] processed files: {total_files}, sentences written: {total_sentences}")
     print(f"[OUT] {out_path.resolve()}")
+    print("hello world")
 
 
 if __name__ == "__main__":
