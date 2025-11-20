@@ -175,6 +175,18 @@ def _candidate_number_span(s: str) -> str:
 # --- Normalization helper for noisy DOCX text ---
 import re
 
+TOKEN_PATTERN = re.compile(
+    r'\d{1,2}:\d{2}'                       # 13:20
+    r'|\d{1,2}\.\d{1,2}\.\d{4}'            # 1.1.2013
+    r'|\d+\.\d+'                           # 3333.3333
+    r'|\d+(?:,\d{3})*(?:\.\d+)?%?'         # 23,456  40%  123.45
+    r'|[\dא-ת]\.'                          # א.  1.  (סעיפים/קיצורים)
+    r'|[\w״"\'א-ת]+'                       # מילים בעברית/אנגלית עם גרשיים
+    r'|[:.,!?;%–()]'                       # סימני פיסוק בודדים
+    r'|\d+\.(?=\s*[\w״"\'א-ת]|[:.,!?;%–()])'  # נקודה אחרי מספר כשאחריה מילה/פיסוק
+    r'|\.{3}'                              # ...
+)
+
 TAG_RE = re.compile(r"<<\s*[^<>]{1,20}\s*>>")                  # << יור >>, << דובר >> וכו'
 ZW_RE  = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")  # סימני כיווניות ובקרה
 NIKUD_RE = re.compile(r"[\u0591-\u05C7]")                      # ניקוד וטעמים
@@ -408,26 +420,77 @@ def parse_filename(name: str) -> Tuple[Optional[int], Optional[str], Optional[in
 
 def split_sentences(text: str) -> List[str]:
     """
-    מפצל טקסט למשפטים לפי הביטוי הרגולרי המשופר.
-    שומר על ראשי תיבות כמו 'י. כהן' מחוברים.
+    פיצול טקסט למשפטים, עם הגנות:
+    - לא לחתוך בתאריכים (1.1.2013)
+    - לא לחתוך בזמנים (13:20.)
+    - לא לחתוך בראשי פרקים כמו 'א.' 'ב.' '1.'
     """
-    # שלב 1: פיצול לפי הביטוי
-    # ה-Split של פייתון מוחק את המפריד, אבל אנחנו רוצים לשמור על ההיגיון
-    # לכן נשתמש בשיטה של החלפה בסימן מיוחד ואז פיצול, או פשוט split
+    points = ['א', 'ב', 'ג', 'ד', 'ה', 'ן']
+    split_set = ['.', '?', '!']
+    sentences: List[str] = []
+    current = ""
 
-    # פיצול פשוט (הערה: זה יעלים את הנקודה בסוף המשפט, אבל זה לרוב רצוי ב-NLP)
-    # אם חשוב לך לשמור את הנקודה, הלוגיקה צריכה להיות מורכבת טיפה יותר.
-    # לשימוש הנוכחי (בניית קורפוס) זה מצוין:
+    text = text.strip()
 
-    parts = SENT_SPLIT.split(text)
+    for i, ch in enumerate(text):
+        current += ch
 
-    # ניקוי רווחים וסינון חלקים ריקים
-    final_sentences = [s.strip() for s in parts if s and s.strip()]
-    return final_sentences
+        if ch in split_set:
+            # הגנות שונות :
+
+            # 1) "1." בתחילת מספר/תאריך – אל תפריד
+            if i == 1 and len(text) > 1 and text[i-1].isdigit() and ch == '.':
+                continue
+
+            # 2) "א." / "ב." בתחילת שורה – אל תפריד (סימוני סעיפים)
+            if i == 1 and len(text) > 1 and text[i-1] in points and ch == '.':
+                continue
+
+            # 3) זמן בסגנון "13:20." – אל תפריד על הנקודה הזו
+            if len(text) > i > 3 and ch == '.' and text[i-1].isdigit() and text[i-3] == ':':
+                continue
+
+            # 4) "א." אחרי ":" או "." או ";" – חלק ממספור סעיפים
+            if len(text) > i > 3 and ch == '.' and text[i-1] in points and text[i-3] in [':', '.', ';']:
+                continue
+
+            # 5) "1.2" בתוך מספר עשרוני – שתי ספרות משני הצדדים
+            if len(text) - 1 > i > 0 and ch == '.' and text[i-1].isdigit() and text[i+1].isdigit():
+                continue
+
+            # אם הגענו עד כאן – זו נקודת סוף משפט אמיתית
+            if ch == '.':
+                # לוודא שלא מדובר בנקודה בין שתי ספרות (כבר כיסינו למעלה, אבל נשאיר זהירות)
+                if len(text) - 1 > i > 0 and (not text[i-1].isdigit() or not text[i+1].isdigit()):
+                    sent = current.strip()
+                    if sent:
+                        sentences.append(sent)
+                    current = ""
+            else:
+                # ? או ! → סוף משפט
+                sent = current.strip()
+                if sent:
+                    sentences.append(sent)
+                current = ""
+
+    if current.strip():
+        sentences.append(current.strip())
+
+    return sentences
 
 def token_count(sentence: str) -> int:
-    """Token = whitespace-split word (no morphology)."""
-    return len([t for t in sentence.split() if t.strip()])
+    """Token = תוצאה של tokenize, לא סתם split על רווחים."""
+    tokens = tokenize(sentence)
+    return len([t for t in tokens if t.strip()])
+
+
+
+def tokenize(sentence: str) -> list[str]:
+    """
+    מחזירה רשימת טוקנים (מילים, מספרים, תאריכים, סימני פיסוק)
+    לפי regex של TOKEN_PATTERN.
+    """
+    return TOKEN_PATTERN.findall(sentence)
 
 
 def extract_from_docx(docx_path: Path, protocol_type: Optional[str]) -> Tuple[Optional[str], Optional[int], List[Tuple[str, str, Optional[str], str]]]:
@@ -464,13 +527,6 @@ def extract_from_docx(docx_path: Path, protocol_type: Optional[str]) -> Tuple[Op
     current_norm: Optional[str] = None
     current_party: Optional[str] = None
     buffer: List[str] = []
-
-    def split_sentences(text: str) -> List[str]:
-        parts = [s.strip() for s in SENT_SPLIT.split(text) if s and s.strip()]
-        return parts
-
-    def token_count(sentence: str) -> int:
-        return len([t for t in sentence.split() if t.strip()])
 
     def flush():
         nonlocal buffer, current_raw, current_norm, current_party
@@ -571,8 +627,7 @@ def main():
                 fout.write("\n")
                 total_sentences += 1
 
-    print(f"[OK] processed files: {total_files}, sentences written: {total_sentences}")
-    print(f"[OUT] {out_path.resolve()}")
+
 
 
 
