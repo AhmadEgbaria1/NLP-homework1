@@ -195,11 +195,39 @@ def detect_party_from_name(name: str) -> tuple[str, Optional[str]]:
     return re.sub(r"\s{2,}", " ", name).strip(), party
 
 ROLE_PREFIXES = re.compile(
-    r'^(?:היו["״\']?ר|יו["״\']?ר|יושב[\s\-]*ראש|ח["״]?כ|חבר(?:ת)? הכנסת|מר|גב(?:\'|")?)\s+'
+    r'^(?:'
+    r'היו["״\']?ר|יו["״\']?ר|יושב[\s\-]*ראש|'         # היו"ר, יו"ר, יושב ראש
+    r'ח["״]?כ|חבר(?:ת)? הכנסת|'                       # ח"כ, חברת הכנסת
+    r'מר|גב(?:\'|")?|'                                # מר, גב'
+    r'שר(?:ת)?(?:\s+\S+){0,3}|'                       # שר / שרת + עד 3 מילים (שר החינוך והתרבות)
+    r'סגן(?:ית)?\s+שר(?:\s+\S+){0,3}|'                # סגן שר / סגנית שר + עד 3 מילים
+    r'ראש\s+הממשלה'                                  # ראש הממשלה
+    r')\s+'
 )
+
 ROLE_SUFFIXES = re.compile(
     r'\s*-\s*(?:יו["״\']?ר.*|מ["״\']?מ.*|ממלא.*|שר.*|סגן.*)$'
 )
+#מקפים מופרדים ברווחים 1-10
+NOISE_DASHES_RE = re.compile(r'(?:-\s+){1,10}-')
+#english letters
+LATIN_RE = re.compile(r'[A-Za-z]')
+
+
+
+def is_valid_sentence(sent: str) -> bool:
+    sent = sent.strip()
+
+    # 1. מכיל אותיות באנגלית → למחוק
+    if LATIN_RE.search(sent):
+        return False
+
+    # 2. מכיל דפוס "- -", "- - -", " -   -   - " → למחוק
+    if NOISE_DASHES_RE.search(sent):
+        return False
+
+    return True
+
 
 def normalize_speaker_name(raw: str) -> str:
     s = _normalize_line(raw)
@@ -218,20 +246,28 @@ def _normalize_line(s: str) -> str:
     """Clean invisible/control marks and normalize punctuation before regex matching."""
     # Remove markup tags
     s = TAG_RE.sub("", s)
+
     # Convert NBSP (non-breaking space) to normal space
     s = s.replace("\u00A0", " ")
+
     # Remove directionality and control characters
     s = ZW_RE.sub("", s)
+
     # Remove Hebrew diacritics (nikud)
     s = NIKUD_RE.sub("", s)
+
     # Normalize quotation marks and dashes
     s = (s.replace("”", '"').replace("“", '"').replace("״", '"')
            .replace("’", "'").replace("׳", "'")
            .replace("\u05BE", "-").replace("–", "-").replace("—", "-"))
+
+    # ---- NEW: remove text-break dashes like -- or --- ----
+    s = re.sub(r"\s*[-]{2,}\s*", " ", s)
+
     # Collapse multiple spaces
     s = re.sub(r"\s+", " ", s)
-    return s.strip()
 
+    return s.strip()
 
 
 
@@ -295,9 +331,16 @@ def find_protocol_number(lines: List[str]) -> Optional[int]:
 
 # --- Regexes נוספים ---
 
-# sentence split: end by . ! ? … or colon then space (simple heuristic for Hebrew texts)
-SENT_SPLIT = re.compile(r'[\.!?…]+(?=\s)|:\s+(?=\S)')
+# הסבר לביטוי הרגולרי:
+# 1. (?<!\s[א-ת])  -> Negative Lookbehind: וודא שלפני הנקודה אין "רווח ואות אחת" (מונע חיתוך של ראשי תיבות בשמות, כגון "י. כהן")
+# 2. (?<!\sמס)(?<!\sעמ) -> וודא שלפני הנקודה אין קיצורים נפוצים (מס. או עמ.)
+# 3. [\.\!\?…]+    -> תפוס אחד או יותר סימני סיום משפט (., !, ?, ...)
+# 4. (?=\s|$)      -> Lookahead: וודא שאחרי הסימן יש רווח או סוף שורה
+# 5. |:\s+(?=\S)   -> או: נקודתיים שלאחריהן רווח ואז טקסט (עבור דוברים)
 
+SENT_SPLIT = re.compile(
+    r'(?:(?<!\s[א-ת])(?<!\sמס)(?<!\sעמ)[\.\!\?…]+(?=\s|$)|:\s+(?=\S))',
+    re.UNICODE)
 # speaker line: e.g., 'היו"ר X:', 'ח"כ Y:', 'מר Z:', or generic 'שם:'
 SPEAKER_RE = re.compile(
     r'^\s*(?:היו"ר|היו״ר|יו״ר|יושב(?:\s*ראש)?|מר|גב(?:\'|")?|ח״כ|ח\"כ|חבר(?:ת)? הכנסת)\s*([^:]{1,60}):\s*$'
@@ -364,17 +407,30 @@ def parse_filename(name: str) -> Tuple[Optional[int], Optional[str], Optional[in
 
 
 def split_sentences(text: str) -> List[str]:
-    """Very simple sentence splitter; trims whitespace."""
-    parts = [s.strip() for s in SENT_SPLIT.split(text) if s and s.strip()]
-    return parts
+    """
+    מפצל טקסט למשפטים לפי הביטוי הרגולרי המשופר.
+    שומר על ראשי תיבות כמו 'י. כהן' מחוברים.
+    """
+    # שלב 1: פיצול לפי הביטוי
+    # ה-Split של פייתון מוחק את המפריד, אבל אנחנו רוצים לשמור על ההיגיון
+    # לכן נשתמש בשיטה של החלפה בסימן מיוחד ואז פיצול, או פשוט split
 
+    # פיצול פשוט (הערה: זה יעלים את הנקודה בסוף המשפט, אבל זה לרוב רצוי ב-NLP)
+    # אם חשוב לך לשמור את הנקודה, הלוגיקה צריכה להיות מורכבת טיפה יותר.
+    # לשימוש הנוכחי (בניית קורפוס) זה מצוין:
+
+    parts = SENT_SPLIT.split(text)
+
+    # ניקוי רווחים וסינון חלקים ריקים
+    final_sentences = [s.strip() for s in parts if s and s.strip()]
+    return final_sentences
 
 def token_count(sentence: str) -> int:
     """Token = whitespace-split word (no morphology)."""
     return len([t for t in sentence.split() if t.strip()])
 
 
-def extract_from_docx(docx_path: Path) -> Tuple[Optional[str], Optional[int], List[Tuple[str, str, Optional[str], str]]]:
+def extract_from_docx(docx_path: Path, protocol_type: Optional[str]) -> Tuple[Optional[str], Optional[int], List[Tuple[str, str, Optional[str], str]]]:
     """
     Returns:
       chairman: Optional[str]
@@ -382,7 +438,10 @@ def extract_from_docx(docx_path: Path) -> Tuple[Optional[str], Optional[int], Li
       records:  List of (speaker_raw, speaker_norm, speaker_party, sentence_text)
     """
     doc = Document(str(docx_path))
-    lines = [p.text.strip() for p in doc.paragraphs if p.text and p.text.strip()]
+
+    # נשמור את הפסקאות כדי שנוכל לבדוק bold, אבל גם נבנה lines כמו קודם
+    paragraphs = list(doc.paragraphs)
+    lines = [p.text.strip() for p in paragraphs if p.text and p.text.strip()]
 
     # --- protocol number from content ---
     proto_num = find_protocol_number(lines)
@@ -414,23 +473,52 @@ def extract_from_docx(docx_path: Path) -> Tuple[Optional[str], Optional[int], Li
         return len([t for t in sentence.split() if t.strip()])
 
     def flush():
+        nonlocal buffer, current_raw, current_norm, current_party
         if current_norm and buffer:
             text = " ".join(buffer)
             for sent in split_sentences(text):
-                if token_count(sent) >= 4:
+                if token_count(sent) >= 4 and is_valid_sentence(sent):
                     records.append((current_raw or "לא ידוע", current_norm, current_party, sent))
+
         buffer.clear()
 
-    for ln in lines:
+    # פה מגיע השינוי: לולאה על פסקאות, עם בדיקת bold כשצריך
+    for p in paragraphs:
+        ln = p.text
+        if not ln or not ln.strip():
+            # שורה ריקה – לא סוגרת דובר, פשוט מדלגים / ממשיכים לצבור
+            continue
+
         ln_norm = _normalize_line(ln)
         sm = SPEAKER_RE.match(ln_norm)
+
         if sm:
+            # underline condition ONLY for committee (ptv)
+            if protocol_type == "committee":
+                is_underlined = any(run.underline for run in p.runs if run.text.strip())
+                if not is_underlined:
+                    if current_norm:
+                        buffer.append(ln)
+                    continue
+
+        if sm:
+            # --- תנאי חדש: אם זה ptv והפסקה BOLD – לא דובר, כנראה כותרת ('נכחו:' וכו') ---
+            if protocol_type == "committee":
+                is_bold = any(run.bold for run in p.runs if run.text.strip())
+                if is_bold:
+                    # מתעלמים מהפסקה הזו כדובר; אם כבר יש דובר פעיל – נצרף לטקסט שלו
+                    if current_norm:
+                        buffer.append(ln)
+                    continue
+
+            # אם הגענו לפה – זה באמת דובר חדש
             flush()
             name_raw = (sm.group(1) or sm.group(2) or "").strip(' "\'׳״') or "לא ידוע"
             name_wo_party, party = detect_party_from_name(name_raw)
             current_raw = name_raw
             current_norm = normalize_speaker_name(name_wo_party)
             current_party = party
+
         else:
             if current_norm:
                 buffer.append(ln)
@@ -456,12 +544,12 @@ def main():
             total_files += 1
             protocol_name = docx_path.name
 
-            # From filename we only take: knesset_number + protocol_type (English)
+            # From filename we only take: knesset_number + protocol_type
             knesset_number, protocol_type, _ = parse_filename(protocol_name)
 
             try:
-                # get chairman + protocol number from the document content
-                protocol_chairman, proto_num_from_doc, recs = extract_from_docx(docx_path)
+                protocol_chairman, proto_num_from_doc, recs = extract_from_docx(docx_path, protocol_type)
+
             except Exception as e:
                 sys.stderr.write(f"[WARN] failed to parse {protocol_name}: {e}\n")
                 continue
@@ -485,9 +573,8 @@ def main():
 
     print(f"[OK] processed files: {total_files}, sentences written: {total_sentences}")
     print(f"[OUT] {out_path.resolve()}")
-    print("hello world")
+
 
 
 if __name__ == "__main__":
     main()
-#sdfffffffffffsfsdfsd
