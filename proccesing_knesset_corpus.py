@@ -1,9 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Build a JSONL corpus from Knesset .docx protocols.
-Usage:
-    python processing_knesset_corpus.py <input_dir> <output.jsonl>
 
 Rules:
 - Each output line = one JSON object for one sentence.
@@ -17,7 +14,7 @@ from pathlib import Path
 from typing import List, Tuple, Optional
 from docx import Document  # pip install python-docx
 
-# --- מספרים בעברית ---
+# hebrew numbers
 
 HEB_UNITS = {
     "אפס":0, "אחד":1, "אחת":1, "שניים":2, "שתיים":2, "שני":2, "שתי":2,
@@ -46,7 +43,7 @@ HEB_TENS = {
 HEB_HUNDREDS = {"מאה":100, "מאות":100, "מאתיים":200}
 HEB_THOUSANDS = {"אלף":1000, "אלפים":1000, "אלפיים":2000}
 
-# --- Parties & role markers (derived from your JSONL) ---
+#Parties & role markers
 PARTIES = {
     "הליכוד","העבודה","מרצ","ש\"ס","מפד\"ל","יהדות התורה","חד\"ש","בל\"ד","שינוי","גשר",
     "ישראל ביתנו","התנועה","הבית היהודי","רע\"ם","הרשימה המשותפת","הרשימה הערבית המאוחדת",
@@ -61,7 +58,8 @@ ROLE_HINTS = ("יו\"ר","יו״ר","ועדת","ועדה","השר","שרת","ס�
 
 
 def _strip_vav(tok: str) -> str:
-    # הסר ו'/ה' חיבור בתחילת המילה (למשל: "והתשעים" -> "תשעים", "ושתיים" -> "שתיים")
+    # Remove Hebrew prefix "ו"/"ה" (conjunction or definite article) from the beginning of the word.
+    # Examples: "והתשעים" → "תשעים", "ושתיים"→ "שתיים"
     while tok.startswith(("ו", "ה")) and len(tok) > 1:
         tok = tok[1:]
     return tok
@@ -70,18 +68,18 @@ def _strip_vav(tok: str) -> str:
 
 def hebrew_words_to_int(text: str) -> Optional[int]:
     """
-    ממיר צירוף מספרי בעברית (עם מקפים/ו' חיבור) למספר שלם.
-    דוגמאות: 'שלוש-מאות-ושישים-ושש', 'אלף-ומאתיים-ושלוש', 'שישים ושמונה'.
-    מחזיר None אם לא זוהה.
+    convert hebrew number that written in words to areal number
+    examples: 'שלוש-מאות-ושישים-ושש', 'אלף-ומאתיים-ושלוש', 'שישים ושמונה'.
+    return none if not recognize
     """
     if not text or not text.strip():
         return None
 
-    # נירמול מקפים שונים ל־"-"
+    # Normalize various dash characters to '-'
     t = (text.replace("־", "-")
               .replace("–", "-")
               .replace("—", "-"))
-    # פיצול: גם מקפים וגם רווחים
+    # Split using both hyphens and whitespace
     raw_tokens = []
     for chunk in t.split():
         raw_tokens.extend(chunk.split("-"))
@@ -102,24 +100,24 @@ def hebrew_words_to_int(text: str) -> Optional[int]:
     while i < len(tokens):
         tok = tokens[i]
 
-        # אלפים / אלף / אלפיים
+        # "אלפים / אלף / אלפיים"
         if tok in HEB_THOUSANDS:
             factor = HEB_THOUSANDS[tok]
-            # אם יש ערך מצטבר לפני "אלף/אלפים" נכפיל אותו, אחרת נניח 1
+            # if there is an accumlated number before thousnads we multiply it else assume 1
             current = max(current, 1) * factor
             flush_current()
 
-        # מאות / מאתיים / מאות
+        # "מאות / מאתיים / מאות"
         elif tok in HEB_HUNDREDS:
             factor = HEB_HUNDREDS[tok]
             current = max(current, 1) * factor
 
-        # עשרות (כולל אחת-עשרה וכו')
+        # "עשרות (כולל אחת-עשרה וכו')"
         elif tok in HEB_TENS:
             current += HEB_TENS[tok]
 
         else:
-            # תבנית "X עשרה" לאחר שפוצל – נסה לחבר חזרה
+            #  # Pattern like "X עשרה" after splitting — try to recombine
             if i + 1 < len(tokens) and (tokens[i+1] in ("עשרה", "עשר")):
                 pair = f"{tok}-עשרה"
                 if pair in HEB_TENS:
@@ -129,14 +127,14 @@ def hebrew_words_to_int(text: str) -> Optional[int]:
                     current += 10 + HEB_UNITS[tok]
                     i += 1
                 else:
-                    # לא נראה כמספר
+                    # not avalid number
                     pass
 
-            # יחידות (כולל צורות סמיכות "שלושת" וכו')
+            #units (including smikhut forms like "שלושת")
             elif tok in HEB_UNITS:
                 current += HEB_UNITS[tok]
 
-            # לא מספרי – נתעלם
+            # not avalid number- ignore
             else:
                 pass
 
@@ -146,33 +144,33 @@ def hebrew_words_to_int(text: str) -> Optional[int]:
     return total if total > 0 else None
 
 
-# --- זיהוי מספר הישיבה מראש המסמך (ספרות או מילים) ---
+# detect the session/protocol number from the top of the document (digits or Hebrew words)
 
-# תבניות כותרת שכיחות: "מס' הישיבה", "מספר הישיבה", "פרוטוקול מס'", "ישיבה"
+# common header patterns e.g.: "מס' הישיבה", "מספר הישיבה", "פרוטוקול מס'", "ישיבה"
 HEADER_NUM_PATTERNS = [
-    # ספרות ישירות
+    # direct numeric match eg: '40'...
     re.compile(
         r"(?:מס(?:'|פר)?\s*ה?ישיבה|מס(?:'|פר)?\s*ישיבה|פרוטוקול(?:\s*מס(?:'|פר)?)?)\s*[:\-]?\s*(\d+)",
         re.UNICODE
     ),
-    # מילים לאחר אותן תבניות
+    # numbers that written in words (hebrew)
     re.compile(
         r"(?:מס(?:'|פר)?\s*ה?ישיבה|מס(?:'|פר)?\s*ישיבה|פרוטוקול(?:\s*מס(?:'|פר)?)?)\s*[:\-]?\s*([^\n]{1,80})",
         re.UNICODE
     ),
-    # גיבוי: שורה שמתחילה "הישיבה ..."
+    #  # Fallback: a line starting with "הישיבה ..." (e.g., "הישיבה הארבע עשרה")
     re.compile(r"^\s*ה?ישיבה\s+([^\n]{1,80})$", re.UNICODE),
 ]
 
 def _candidate_number_span(s: str) -> str:
     s = s.strip()
-    # לא חותכים על מקפים או פסיקים
+    # Do not split on hyphens or commas — only split on stronger separators
     for sep in (" של ", ":", ";", "("):
         if sep in s:
             s = s.split(sep)[0]
     return s.strip(" :–—-.,;\"'()[]{}")
 
-# --- Normalization helper for noisy DOCX text ---
+# Normalization helper for noisy DOCX text
 import re
 
 TOKEN_PATTERN = re.compile(
@@ -181,27 +179,30 @@ TOKEN_PATTERN = re.compile(
     r'|\d+\.\d+'                           # 3333.3333
     r'|\d+(?:,\d{3})*(?:\.\d+)?%?'         # 23,456  40%  123.45
     r'|[\dא-ת]\.'                          # א.  1.  (סעיפים/קיצורים)
-    r'|[\w״"\'א-ת]+'                       # מילים בעברית/אנגלית עם גרשיים
-    r'|[:.,!?;%–()]'                       # סימני פיסוק בודדים
-    r'|\d+\.(?=\s*[\w״"\'א-ת]|[:.,!?;%–()])'  # נקודה אחרי מספר כשאחריה מילה/פיסוק
+    r'|[\w״"\'א-ת]+'                       # words in hebrew with qoutation marks
+    r'|[:.,!?;%–()]'                       # single punctation characters
+    r'|\d+\.(?=\s*[\w״"\'א-ת]|[:.,!?;%–()])'  # Dot after a number when followed by word/punctuation
     r'|\.{3}'                              # ...
 )
 
-TAG_RE = re.compile(r"<<\s*[^<>]{1,20}\s*>>")                  # << יור >>, << דובר >> וכו'
-ZW_RE  = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")  # סימני כיווניות ובקרה
-NIKUD_RE = re.compile(r"[\u0591-\u05C7]")                      # ניקוד וטעמים
+TAG_RE = re.compile(r"<<\s*[^<>]{1,20}\s*>>")                # Matches markup tags such as << יור >> , << דובר >> etc.
+ZW_RE  = re.compile(r"[\u200e\u200f\u202a-\u202e\u2066-\u2069\ufeff]")  # Directionality and control characters (Unicode bidi markers)
+NIKUD_RE = re.compile(r"[\u0591-\u05C7]")                     # Hebrew diacritics (nikud and cantillation marks)
 
+#helper function that extracts all text that appears inside parentheses
 def _extract_parenthetical_chunks(name: str):
     return re.findall(r"\(([^)]+)\)", name)
 
 def detect_party_from_name(name: str) -> tuple[str, Optional[str]]:
-    """מחזירה (שם_ללא_סוגריים_מפלגתיים, מפלגה|None). מתעלמת מסוגריים שהם תפקיד/ועדה."""
+    """Returns (name_without_party_parentheses, party_or_None).
+        Ignores parentheses that contain roles/committee titles rather than parties.
+     """
     chunks = _extract_parenthetical_chunks(name)
     party = None
     for ch in chunks:
         if ch in PARTIES and not any(h in ch for h in ROLE_HINTS):
             party = ch
-            # הסר רק את סוגריי המפלגה מהשם
+            # remove only the only parentheses conatins party name
             name = re.sub(r"\s*\("+re.escape(ch)+r"\)\s*", " ", name).strip()
             break
     return re.sub(r"\s{2,}", " ", name).strip(), party
@@ -220,22 +221,28 @@ ROLE_PREFIXES = re.compile(
 ROLE_SUFFIXES = re.compile(
     r'\s*-\s*(?:יו["״\']?ר.*|מ["״\']?מ.*|ממלא.*|שר.*|סגן.*)$'
 )
-#מקפים מופרדים ברווחים 1-10
-NOISE_DASHES_RE = re.compile(r'(?:-\s+){1,10}-')
-#english letters
+
+# Noisy dash sequences: two or more dashes (any type: -, –, —) with or without spaces
+NOISE_DASHES_RE = re.compile(r'([\-–—]\s*){2,}')
+ELLIPSIS_RE = re.compile(r'\.{3}|…')  # Ellipsis: either "..." or the single-character ellipsis "…"
+
 LATIN_RE = re.compile(r'[A-Za-z]')
-
-
 
 def is_valid_sentence(sent: str) -> bool:
     sent = sent.strip()
+    if not sent:
+        return False
 
-    # 1. מכיל אותיות באנגלית → למחוק
+    # delete english letters
     if LATIN_RE.search(sent):
         return False
 
-    # 2. מכיל דפוס "- -", "- - -", " -   -   - " → למחוק
+    # Reject noisy dash sequences like "--", "- -", "–––", "– – –"
     if NOISE_DASHES_RE.search(sent):
+        return False
+
+    # Reject ellipsis sequences ("..." or "…"), if desired
+    if ELLIPSIS_RE.search(sent):
         return False
 
     return True
@@ -284,28 +291,30 @@ def _normalize_line(s: str) -> str:
 
 
 def find_protocol_number(lines: List[str]) -> Optional[int]:
-    """מנסה לאתר מספר ישיבה כספרות או כמילים.
-    1) מעבר ראשון: עד 200 שורות ראשונות (כמו קודם)
-    2) מעבר שני (fallback): סריקה על כל הטקסט המאוחד
     """
-    # --- מעבר ראשון: זהה לקודם בערך ---
+    Try to detect the session/protocol number, either as digits or as Hebrew words.
+    Strategy:
+      1) First pass: scan up to the first 200 lines.
+      2) Second pass (fallback): scan the entire text as one string.
+    """
+    # first pass
     for ln in lines[:200]:
         text = ln.strip()
-        # ספרות
+        # try direct numeric path
         m0 = HEADER_NUM_PATTERNS[0].search(text)
         if m0:
             try:
                 return int(m0.group(1))
             except ValueError:
                 pass
-        # מילים אחרי תבניות
+        # words after specifoc patterns
         m1 = HEADER_NUM_PATTERNS[1].search(text)
         if m1:
             seg = _candidate_number_span(m1.group(1))
             n = hebrew_words_to_int(seg)
             if n is not None:
                 return n
-        # גיבוי: "הישיבה ..."
+        # fallback lines starting with a "ישיבה"
         m2 = HEADER_NUM_PATTERNS[2].match(text)
         if m2:
             seg = _candidate_number_span(m2.group(1))
@@ -313,10 +322,10 @@ def find_protocol_number(lines: List[str]) -> Optional[int]:
             if n is not None:
                 return n
 
-    # --- מעבר שני: סריקה על כל המסמך (למקרה שהמספר מופיע מאוחר יותר/באמצע שורה) ---
+    # second pass on the whole file if we didnt find it in the first 200 lines
     full = "\n".join(lines)
 
-    # קודם נסה ספרות בכל מקום (לא רק בתחילת שורה)
+    # Try direct numeric match (digits)
     m = HEADER_NUM_PATTERNS[0].search(full)
     if m:
         try:
@@ -324,14 +333,14 @@ def find_protocol_number(lines: List[str]) -> Optional[int]:
         except ValueError:
             pass
 
-    # אחר כך מילים בכל מקום אחרי אותן תבניות
+    # Try Hebrew words after the header patterns
     for m in HEADER_NUM_PATTERNS[1].finditer(full):
         seg = _candidate_number_span(m.group(1))
         n = hebrew_words_to_int(seg)
         if n is not None:
             return n
 
-    # לבסוף: גם "הישיבה ..." אם מופיע באמצע שורה
+    # Fallback: lines starting with "הישיבה ..."
     for m in re.finditer(r"ה?ישיבה\s+([^\n]{1,80})", full):
         seg = _candidate_number_span(m.group(1))
         n = hebrew_words_to_int(seg)
@@ -341,14 +350,26 @@ def find_protocol_number(lines: List[str]) -> Optional[int]:
     return None
 
 
-# --- Regexes נוספים ---
+# another Regexes
 
-# הסבר לביטוי הרגולרי:
-# 1. (?<!\s[א-ת])  -> Negative Lookbehind: וודא שלפני הנקודה אין "רווח ואות אחת" (מונע חיתוך של ראשי תיבות בשמות, כגון "י. כהן")
-# 2. (?<!\sמס)(?<!\sעמ) -> וודא שלפני הנקודה אין קיצורים נפוצים (מס. או עמ.)
-# 3. [\.\!\?…]+    -> תפוס אחד או יותר סימני סיום משפט (., !, ?, ...)
-# 4. (?=\s|$)      -> Lookahead: וודא שאחרי הסימן יש רווח או סוף שורה
-# 5. |:\s+(?=\S)   -> או: נקודתיים שלאחריהן רווח ואז טקסט (עבור דוברים)
+# Explanation of the sentence-splitting regex:
+# 1. (?<!\s[א-ת])
+#       Negative lookbehind: ensure the period is NOT preceded by "space + Hebrew letter".
+#       Prevents splitting inside initials like "י. כהן".
+#
+# 2. (?<!\sמס)(?<!\sעמ)
+#       Negative lookbehind: ensure the period is not part of common abbreviations
+#       such as "מס." or "עמ.".
+#
+# 3. [\.\!\?…]+
+#       Match one or more sentence-ending characters: ".", "!", "?", "…"
+#
+# 4. (?=\s|$)
+#       Lookahead: ensure the character is followed by whitespace or end-of-line.
+#
+# 5. |:\s+(?=\S)
+#       OR: match a colon followed by whitespace and then a non-space —
+#       used to detect speaker lines such as "מר כהן: ..."
 
 SENT_SPLIT = re.compile(
     r'(?:(?<!\s[א-ת])(?<!\sמס)(?<!\sעמ)[\.\!\?…]+(?=\s|$)|:\s+(?=\S))',
@@ -363,7 +384,11 @@ SPEAKER_RE = re.compile(
 # מקפים אפשריים (רגיל / en / em)
 _DASH = r"[–—-]"
 
-# "קדימה": היו"ר ...  (כולל מ"מ, כולל סוגריים משולשים, נקודתיים אופציונליים)
+ # Forward-style chairman declaration near the document header.
+ # Examples:
+# #   "היו"ר משה כהן"
+# #   "מ"מ היו"ר דני דנון"
+# #   "< היו"ר עליזה לביא >"
 CHAIR_FWD_RE = re.compile(
     r'^\s*<?\s*(?:מ["״\']?מ\s*)?(?:היו["״\']?ר|יו["״\']?ר|יושב[\s\-]*ראש(?:\s*הוועדה)?)[:\s]+([^:<>]{1,60})\s*:?\s*>?\s*$',
     re.UNICODE
@@ -420,10 +445,13 @@ def parse_filename(name: str) -> Tuple[Optional[int], Optional[str], Optional[in
 
 def split_sentences(text: str) -> List[str]:
     """
-    פיצול טקסט למשפטים, עם הגנות:
-    - לא לחתוך בתאריכים (1.1.2013)
-    - לא לחתוך בזמנים (13:20.)
-    - לא לחתוך בראשי פרקים כמו 'א.' 'ב.' '1.'
+
+    Split Hebrew text into sentences with safeguards.
+    Protect against false splits in:
+      - dates (e.g., 1.1.2013)
+      - times (e.g., 13:20.)
+      - section markers such as 'א.' / 'ב.' / '1.'
+
     """
     points = ['א', 'ב', 'ג', 'ד', 'ה', 'ן']
     split_set = ['.', '?', '!']
@@ -436,31 +464,31 @@ def split_sentences(text: str) -> List[str]:
         current += ch
 
         if ch in split_set:
-            # הגנות שונות :
 
-            # 1) "1." בתחילת מספר/תאריך – אל תפריד
+
+            # 1. at the beginning of a number/date → do NOT split
             if i == 1 and len(text) > 1 and text[i-1].isdigit() and ch == '.':
                 continue
 
-            # 2) "א." / "ב." בתחילת שורה – אל תפריד (סימוני סעיפים)
+            # 2."א." / "ב." at the start of a line → section markers, do NOT split
             if i == 1 and len(text) > 1 and text[i-1] in points and ch == '.':
                 continue
 
-            # 3) זמן בסגנון "13:20." – אל תפריד על הנקודה הזו
+            # 3) Time format like "13:20." → do NOT split
             if len(text) > i > 3 and ch == '.' and text[i-1].isdigit() and text[i-3] == ':':
                 continue
 
-            # 4) "א." אחרי ":" או "." או ";" – חלק ממספור סעיפים
+            # 4) "א." after ":" or "." or ";" → part of section numbering
             if len(text) > i > 3 and ch == '.' and text[i-1] in points and text[i-3] in [':', '.', ';']:
                 continue
 
-            # 5) "1.2" בתוך מספר עשרוני – שתי ספרות משני הצדדים
+            # 5) Decimal number like "1.2" (digit-dot-digit) → do NOT split
             if len(text) - 1 > i > 0 and ch == '.' and text[i-1].isdigit() and text[i+1].isdigit():
                 continue
 
-            # אם הגענו עד כאן – זו נקודת סוף משפט אמיתית
+            # if we rech here this dot is for real sentence boundary
             if ch == '.':
-                # לוודא שלא מדובר בנקודה בין שתי ספרות (כבר כיסינו למעלה, אבל נשאיר זהירות)
+                # Avoid splitting on number-dot-number, although already checked above
                 if len(text) - 1 > i > 0 and (not text[i-1].isdigit() or not text[i+1].isdigit()):
                     sent = current.strip()
                     if sent:
@@ -479,7 +507,7 @@ def split_sentences(text: str) -> List[str]:
     return sentences
 
 def token_count(sentence: str) -> int:
-    """Token = תוצאה של tokenize, לא סתם split על רווחים."""
+    """Count the number of tokens produced by tokenize(), not just whitespace splits."""
     tokens = tokenize(sentence)
     return len([t for t in tokens if t.strip()])
 
@@ -487,9 +515,9 @@ def token_count(sentence: str) -> int:
 
 def tokenize(sentence: str) -> list[str]:
     """
-    מחזירה רשימת טוקנים (מילים, מספרים, תאריכים, סימני פיסוק)
-    לפי regex של TOKEN_PATTERN.
-    """
+      Return a list of tokens (words, numbers, dates, punctuation marks)
+      according to the TOKEN_PATTERN regex.
+      """
     return TOKEN_PATTERN.findall(sentence)
 
 
@@ -502,14 +530,15 @@ def extract_from_docx(docx_path: Path, protocol_type: Optional[str]) -> Tuple[Op
     """
     doc = Document(str(docx_path))
 
-    # נשמור את הפסקאות כדי שנוכל לבדוק bold, אבל גם נבנה lines כמו קודם
+    # Keep the full paragraph objects (to inspect bold/underline),
+    # but also build a simple list of non-empty text lines.
     paragraphs = list(doc.paragraphs)
     lines = [p.text.strip() for p in paragraphs if p.text and p.text.strip()]
 
-    # --- protocol number from content ---
+    #  protocol number from content
     proto_num = find_protocol_number(lines)
 
-    # --- chairman (near top) ---
+    # chairman (near top)
     chairman = None
     for ln in lines[:300]:
         text = _normalize_line(ln)
@@ -521,7 +550,7 @@ def extract_from_docx(docx_path: Path, protocol_type: Optional[str]) -> Tuple[Op
             chairman = cand
             break
 
-    # --- speakers & sentences ---
+    # speakers and sentences
     records: List[Tuple[str, str, Optional[str], str]] = []  # (raw, norm, party, sentence)
     current_raw: Optional[str] = None
     current_norm: Optional[str] = None
@@ -538,36 +567,44 @@ def extract_from_docx(docx_path: Path, protocol_type: Optional[str]) -> Tuple[Op
 
         buffer.clear()
 
-    # פה מגיע השינוי: לולאה על פסקאות, עם בדיקת bold כשצריך
+    # Iterate over paragraphs so we can inspect bold/underline when needed
     for p in paragraphs:
         ln = p.text
         if not ln or not ln.strip():
-            # שורה ריקה – לא סוגרת דובר, פשוט מדלגים / ממשיכים לצבור
+            #empty line: dont close the current speaker, just skip
             continue
 
         ln_norm = _normalize_line(ln)
         sm = SPEAKER_RE.match(ln_norm)
 
         if sm:
-            # underline condition ONLY for committee (ptv)
             if protocol_type == "committee":
-                is_underlined = any(run.underline for run in p.runs if run.text.strip())
-                if not is_underlined:
-                    if current_norm:
-                        buffer.append(ln)
-                    continue
+                # decide whether we require underline based on knesset number
+                kns, _, _ = parse_filename(docx_path.name)
+                require_underline = (kns is None) or (kns < 23)
+
+                if require_underline:
+                    is_underlined = any(run.underline for run in p.runs if run.text.strip())
+                    if not is_underlined:
+                        if current_norm:
+                            buffer.append(ln)
+                        continue
+                # if kns>=23 we dont require underline SPEAKER_RE match enough
+
+
 
         if sm:
-            # --- תנאי חדש: אם זה ptv והפסקה BOLD – לא דובר, כנראה כותרת ('נכחו:' וכו') ---
+            # for committee protocols, bold paragraphs like "נכחו:" are headings,
+            #             # not actual speaker lines.
             if protocol_type == "committee":
                 is_bold = any(run.bold for run in p.runs if run.text.strip())
                 if is_bold:
-                    # מתעלמים מהפסקה הזו כדובר; אם כבר יש דובר פעיל – נצרף לטקסט שלו
+                    # Ignore this as a new speaker; if we already have one, append to their text
                     if current_norm:
                         buffer.append(ln)
                     continue
 
-            # אם הגענו לפה – זה באמת דובר חדש
+            # if we reach here its really anew speaker
             flush()
             name_raw = (sm.group(1) or sm.group(2) or "").strip(' "\'׳״') or "לא ידוע"
             name_wo_party, party = detect_party_from_name(name_raw)
