@@ -35,3 +35,13 @@ The core of this assignment was to transform hundreds of raw `.docx` files conta
    ```bash
    git clone [https://github.com/AhmadEgbaria1/NLP-homework1.git](https://github.com/AhmadEgbaria1/NLP-homework1.git)
    cd NLP-homework1
+2.Setup:
+Ensure you have the required library for Word documents:
+
+Bash
+pip install python-docx
+3.Process the data:
+Place your .docx files in the data/ folder and run:
+
+Bash
+python main.py
